@@ -292,7 +292,7 @@ func (tch *tileCachingHandler) fetchAndCacheTile(ctx context.Context, path strin
 		source  Source
 	}
 
-	innerContents, err, _ := singleflightDoRetryWhenTimeLeft(ctx, tch.cacheGroup, dedupKey, func() (*entriesAndSource, error) {
+	innerContents, err, _ := singleflightDo(tch.cacheGroup, dedupKey, func() (*entriesAndSource, error) {
 		contents, source, err := tch.fetchAndCacheTileNoDedup(ctx, path, tile)
 		if err != nil {
 			return nil, err
@@ -327,31 +327,13 @@ func (tch *tileCachingHandler) fetchAndCacheTileNoDedup(ctx context.Context, pat
 
 }
 
-// singleflightDoRetryWhenTimeLeft is a wrapper around singleflight.Group.Do
-// that a) returns the exact type of the first return type of the function fn
-// instead of interface{} (singleflight was built before generics) and b)
-// retries the function fn if the call to fn had timed out but the current
-// goroutine's Context still has time left before its deadline.
-// singleflightDoRetryWhenTimeLeft will retry twice (that is, it will call the
-// function fn up to 3 times) before giving up.
-func singleflightDoRetryWhenTimeLeft[V any](ctx context.Context, group *singleflight.Group, key string, fn func() (V, error)) (V, error, bool) {
+// singleflightDo is a wrapper around singleflight.Group.Do that, instead of
+// returning an interface{}, returns the exact type of the first return type of
+// the function fn. (singleflight was built before generics)
+func singleflightDo[V any](group *singleflight.Group, key string, fn func() (V, error)) (V, error, bool) {
 	out, err, shared := group.Do(key, func() (interface{}, error) {
 		return fn()
 	})
-	// Sometimes the first request into the singleflight group is one with a
-	// tighter Context timeout than the one currently running. If there's still
-	// time left before our current Context's deadline (the ctx.Err check) and
-	// the singleflight request died on a Context timeout, try again. We check
-	// that ctx.Err isn't nil instead of if it is a DeadlineExceeded because the
-	// Context can be cancelled in other ways and we don't want to retry in
-	// those cases, either.
-	i := 0
-	for errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && i < 2 {
-		out, err, shared = group.Do(key, func() (interface{}, error) {
-			return fn()
-		})
-		i++
-	}
 	return out.(V), err, shared
 }
 
