@@ -223,7 +223,6 @@ type tileCachingHandler struct {
 	s3Prefix  string // The prefix to add to the path when caching tiles in S3. Must not be empty.
 	s3Bucket  string // The S3 bucket to use for caching tiles. Must not be empty.
 
-	fetchGroup *singleflight.Group
 	cacheGroup *singleflight.Group
 }
 
@@ -242,33 +241,22 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	tile := makeTile(start, int64(tch.tileSize), tch.logURL, tch.s3Prefix)
-
-	contents, err := getFromS3(r.Context(), tch.s3Service, tch.s3Bucket, tile)
-	if err != nil && errors.Is(err, noSuchKey{}) {
-		contents, err = tch.getAndCacheTile(r.Context(), r.URL.Path, tile)
-		if err != nil {
-			status := http.StatusInternalServerError
-			var statusCodeErr statusCodeError
-			if errors.As(err, &statusCodeErr) {
-				status = statusCodeErr.statusCode
-			}
-			w.WriteHeader(status)
-			fmt.Fprintln(w, err)
-			return
+	contents, source, err := tch.fetchAndCacheTile(r.Context(), r.URL.Path, tile)
+	if err != nil {
+		status := http.StatusInternalServerError
+		var statusCodeErr statusCodeError
+		if errors.As(err, &statusCodeErr) {
+			status = statusCodeErr.statusCode
 		}
-
-		if len(contents.Entries) != tch.tileSize {
-			w.Header().Set("X-Partial-Tile", "true")
-		}
-
-		w.Header().Set("X-Source", "CT log")
-	} else if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "reading from s3: %s\n", err)
+		w.WriteHeader(status)
+		fmt.Fprintln(w, err)
 		return
-	} else {
-		w.Header().Set("X-Source", "S3")
 	}
+	if len(contents.Entries) != tch.tileSize {
+		w.Header().Set("X-Partial-Tile", "true")
+	}
+
+	w.Header().Set("X-Source", string(source))
 
 	// Truncate to match the request
 	prefixToRemove := start - tile.start
@@ -287,34 +275,65 @@ func (tch *tileCachingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	encoder.Encode(contents)
 }
 
-func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, path string, tile tile) (*entries, error) {
+// Source is the public name of the storage system a tile was returned from and
+// is set in the X-Partial-Tile header
+type Source string
+
+const (
+	CTLogSource Source = "CT log"
+	S3Source    Source = "S3"
+)
+
+func (tch *tileCachingHandler) fetchAndCacheTile(ctx context.Context, path string, tile tile) (*entries, Source, error) {
 	dedupKey := fmt.Sprintf("logURL-%s-path-%s-tile-%d-%d", tile.logURL, path, tile.start, tile.end)
-	innerContents, err, _ := retryWhenTimeLeftSingleflightDo(tch.cacheGroup, ctx, dedupKey, func() (*entries, error) {
-		contents, err := getTileFromBackend(ctx, path, tile)
+
+	type entriesAndSource struct {
+		entries *entries
+		source  Source
+	}
+
+	innerContents, err, _ := singleflightDoRetryWhenTimeLeft(tch.cacheGroup, ctx, dedupKey, func() (*entriesAndSource, error) {
+		contents, source, err := tch.fetchAndCacheTileNoDedup(ctx, path, tile)
 		if err != nil {
-			return contents, err
+			return nil, err
 		}
-		// If we got a partial tile, assume we are at the end of the log and the
-		// last tile isn't filled up yet. In that case, don't write to S3, but
-		// still return results to the user.
-		if len(contents.Entries) == tch.tileSize {
-			err := writeToS3(ctx, tch.s3Service, tch.s3Bucket, tile, contents)
-			if err != nil {
-				return contents, fmt.Errorf("writing to s3: %w", err)
-			}
-		}
-		return contents, nil
+		return &entriesAndSource{contents, source}, nil
 	})
-	return innerContents, err
+	return innerContents.entries, innerContents.source, err
 }
 
-// retryWhenTimeLeftSingleflightDo is a wrapper around singleflight.Group.Do
-// that a) returns the exact type of the called function (singleflight was built
-// before generics) and b) retries the function fn if the call to fn had timed
-// out but the current goroutine's Context still has time left before its
-// deadline. retryWhenTimeLeftSingleflightDo will retry twice (that is, it will
-// call the function fn up to 3 times) before giving up.
-func retryWhenTimeLeftSingleflightDo[V any](group *singleflight.Group, ctx context.Context, key string, fn func() (V, error)) (V, error, bool) {
+func (tch *tileCachingHandler) fetchAndCacheTileNoDedup(ctx context.Context, path string, tile tile) (*entries, Source, error) {
+	contents, err := getFromS3(ctx, tch.s3Service, tch.s3Bucket, tile)
+	if err == nil {
+		return contents, S3Source, nil
+	}
+	if !errors.Is(err, noSuchKey{}) {
+		return nil, S3Source, err
+	}
+	contents, err = getTileFromBackend(ctx, path, tile)
+	if err != nil {
+		return nil, CTLogSource, err
+	}
+	// If we got a partial tile, assume we are at the end of the log and the
+	// last tile isn't filled up yet. In that case, don't write to S3, but
+	// still return results to the user.
+	if len(contents.Entries) == tch.tileSize {
+		err := writeToS3(ctx, tch.s3Service, tch.s3Bucket, tile, contents)
+		if err != nil {
+			return nil, CTLogSource, fmt.Errorf("writing to s3: %w", err)
+		}
+	}
+	return contents, CTLogSource, nil
+
+}
+
+// singleflightDoRetryWhenTimeLeft is a wrapper around singleflight.Group.Do
+// that a) returns the exact type of the first return type of the function fn
+// (singleflight was built before generics) and b) retries the function fn if
+// the call to fn had timed out but the current goroutine's Context still has
+// time left before its deadline. singleflightDoRetryWhenTimeLeft will retry
+// twice (that is, it will call the function fn up to 3 times) before giving up.
+func singleflightDoRetryWhenTimeLeft[V any](group *singleflight.Group, ctx context.Context, key string, fn func() (V, error)) (V, error, bool) {
 	out, err, shared := group.Do(key, func() (interface{}, error) {
 		return fn()
 	})
