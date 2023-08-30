@@ -329,10 +329,11 @@ func (tch *tileCachingHandler) fetchAndCacheTileNoDedup(ctx context.Context, pat
 
 // singleflightDoRetryWhenTimeLeft is a wrapper around singleflight.Group.Do
 // that a) returns the exact type of the first return type of the function fn
-// (singleflight was built before generics) and b) retries the function fn if
-// the call to fn had timed out but the current goroutine's Context still has
-// time left before its deadline. singleflightDoRetryWhenTimeLeft will retry
-// twice (that is, it will call the function fn up to 3 times) before giving up.
+// instead of interface{} (singleflight was built before generics) and b)
+// retries the function fn if the call to fn had timed out but the current
+// goroutine's Context still has time left before its deadline.
+// singleflightDoRetryWhenTimeLeft will retry twice (that is, it will call the
+// function fn up to 3 times) before giving up.
 func singleflightDoRetryWhenTimeLeft[V any](ctx context.Context, group *singleflight.Group, key string, fn func() (V, error)) (V, error, bool) {
 	out, err, shared := group.Do(key, func() (interface{}, error) {
 		return fn()
