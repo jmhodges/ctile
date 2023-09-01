@@ -325,9 +325,13 @@ func (tch *tileCachingHandler) getAndCacheTile(ctx context.Context, tile tile) (
 		return nil, sourceCTLog, fmt.Errorf("error reading tile from backend: %w", err)
 	}
 
-	// If we got a partial tile, assume we are at the end of the log and the last
-	// tile isn't filled up yet. In that case, don't write to S3, but still return
-	// results to the user.
+	// If we got a partial tile, assume we are at the end of the log and the
+	// last tile isn't filled up yet. In that case, don't write to S3, but still
+	// return results to the user. This is okay as long as our assumption of how
+	// the backing CT log works with tiles (including tile size) and that the
+	// backing CT log system is efficient at returning the end of the log but
+	// not at returning older parts of the log. See the Rationale section of the
+	// README for discussion.
 	if tch.isPartialTile(contents) {
 		return contents, sourceCTLog, nil
 	}

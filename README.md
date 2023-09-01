@@ -1,15 +1,38 @@
 # CTile
 
 This is a caching proxy for the get-entries endpoint of a CT log, which uses S3
-as its backing store. It uses the concept of "tiles" of entries, where each tile
-is a fixed size N (e.g. 256 log entries) and the sequence of tiles starts at 0.
-Regardless of what `start` and `end` parameters CTile receives for a request, it
-will transform those into a tile-sized request to its backend, by rounding down
-`start` to the nearest multiple of N and requesting exactly N items from the
-backend. If the request is successful, CTile checks that the response contains
-exactly N items, re-encodes as gzipped CBOR, and stores the result in S3. It then
-returns modified JSON to the user, removing items from the head and tail to ensure
-that the first entry actually corresponds to the first entry requested by the user
+as its backing store.
+
+# Rationale
+
+CT log systems based on relational databases (like Trillian when deployed with
+its MySQL backend) can have performance problems on memory-constrained systems
+when many old log entries are requested. Typically, requests for the latest log
+entries are already in the relational database's heap while older ones remain on
+disk. Many CT log consuming systems, however, do full downloads of a log and
+sometimes do them regularly. A system that can speed up look ups for old entries
+and doesn't worry so much about new entries is desirable.
+
+Similarly, those backing CT log systems often operate on the idea of "tiles"
+that a caching layer could have detailed knowledge of to ensure its caching
+mechanisms work well with the log.
+
+Finally, it can be operationally easier to put a proxy in front of those CT log
+systems than experiment within them.
+
+CTile is designed with those ideas in mind.
+
+# Design
+
+CTile uses the concept of "tiles" of entries, where each tile is a fixed size N
+(e.g. 256 log entries) and the sequence of tiles starts at 0. Regardless of what
+`start` and `end` parameters CTile receives for a request, it will transform
+those into a tile-sized request to its backend, by rounding down `start` to the
+nearest multiple of N and requesting exactly N items from the backend. If the
+request is successful, CTile checks that the response contains exactly N items,
+re-encodes as gzipped CBOR, and stores the result in S3. It then returns
+modified JSON to the user, removing items from the head and tail to ensure that
+the first entry actually corresponds to the first entry requested by the user
 and that the response includes at most as many entries as requested.
 
 When looking up entries in the cache, CTile also rounds `start` down to the
