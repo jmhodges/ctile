@@ -18,7 +18,13 @@ that a caching layer could have detailed knowledge of to ensure its caching
 mechanisms work well with the log.
 
 Finally, it can be operationally easier to put a proxy in front of those CT log
-systems than experiment within them.
+systems than experiment within them. Trillian's type hierarchy, for instance,
+makes it hard-to-impossible to avoid taking a MySQL transaction in
+GetEntriesByRange requests even if implementing a storage provider
+(storage.Provider, storage.LogStorage) that wraps around the MySQL storage
+provider to direct GetEntriesByRange RPCs to a caching layer when possible. The
+`SnapshotForTree` call is surprisingly broad and not desirable to delay for all
+RPCs.
 
 CTile is designed with those ideas in mind.
 
